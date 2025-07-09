@@ -159,8 +159,86 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  has_moe_layers=False,
                  fp16_master_weights_and_gradients=False,
                  elastic_checkpoint=False,
-                 check_grad_overflow=True):
+                 check_grad_overflow=True,
+                 method="RR",
+                 rings=4,
+                 shuffle_step=1,
+                 slice_count=2):
+        self.split_sizes=[]
+        self.outer_groups=[]
+        self.outer_group=None
+        self.method=method
+        self.rings=rings
+        self.shuffle_step=shuffle_step
+        self.batch_count=0
+        self.slice_count=slice_count
+        self.real_world_size=dist.get_world_size()
+        self.real_rank=dist.get_rank()
+        self.rank=self.real_rank//slice_count
+        self.world_group=dist.get_world_group()
+        if self.real_world_size%self.slice_count:
+            logger.error("slice_count cannot be divided by real world size")
+        self.world_size=self.real_world_size//self.slice_count
+        real_ring_size=self.real_world_size//self.rings
+        
+        self.slice_pgs=[]
+        self.slice_pg=None
+        based=range(self.real_world_size)
+        arrange = [based[i:i+self.slice_count] for i in range(0, self.real_world_size, self.slice_count)]
+        for group in arrange:
+            self.slice_pgs.append(dist.new_group(group))
+            if self.real_rank in group:
+                self.slice_pg=self.slice_pgs[-1]
+        
+        self.slice_partition=self.real_rank%self.slice_count
+        
+        self.allreduce_groups=[]
+        self.allreduce_group=None
+        if method=="Gossip":
+            self.allreduce_group=self.world_group
+            self.alpha=torch.tensor(1.0 / self.world_size, dtype=torch.float16,device="cuda")
+            self.p=1.0
+            self.msg={}
+            self.queue=[]
+            for i in range(self.real_world_size):
+                self.msg[i]=[]
+        if method=="shuffle":
+            # self._shuffle()
+            based=list(range(self.world_size))
+            ring_size=self.world_size//self.rings
+            arrange=[based[i*ring_size:(i+1)*ring_size] for i in range(self.rings)]
+            for group in arrange:
+                allreduce_group=self._create_real_groups(group,self.allreduce_groups)
+                if self.rank in group and allreduce_group!=None:
+                    self.allreduce_group=allreduce_group
+                    
+        if method=="RR":
+            group=range(self.world_size)
+            self.allreduce_group=self._create_real_groups(group,self.allreduce_groups)
+        if method=="H-RR":
+            self.rings=2
+            based=range(self.world_size)
+            ring_size=self.world_size//self.rings
+            top_group=range(0, self.world_size, ring_size)
+            self.top_node=ring_size*(self.rank//ring_size)*self.slice_count+self.slice_partition
+            arrange=[based[i:i+ring_size] for i in top_group]
+            
+            # logger.info(f"Rank {self.real_rank} -> Real Rank: {self.rank}, Top Node: {self.top_node}")
+            # logger.info(f"Rank {self.real_rank} -> Top Group: {list(top_group)}")
+            # logger.info(f"Rank {self.real_rank} -> Arranged Groups: {arrange}")
 
+            for group in arrange:
+                allreduce_group=self._create_real_groups(group,self.allreduce_groups)
+                if self.rank in group and allreduce_group!=None:
+                    self.allreduce_group=allreduce_group
+            self.top_allredcue_groups=[]
+            self.top_allreduce_group=self._create_real_groups(top_group,self.top_allredcue_groups)
+            # logger.info(f"Rank {self.real_rank} -> All Ranks in Allreduce Group: {dist.get_all_ranks_from_group(self.allreduce_group)}")
+            self.in_top_group=False
+            if self.rank in top_group:
+                self.in_top_group=True
+                # logger.info(f"Rank {self.real_rank} -> All Ranks in Top Allreduce Group: {dist.get_all_ranks_from_group(self.top_allreduce_group)}")
+            
         if offload_optimizer_config is not None and offload_optimizer_config.device != OffloadDeviceEnum.none:
             self.cpu_offload = True
             self.cpu_offload_pin_memory = offload_optimizer_config.pin_memory
@@ -208,7 +286,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.device = get_accelerator().current_device_name() if not self.cpu_offload else 'cpu'
 
-        self.dp_process_group = dp_process_group
+        # self.dp_process_group = dp_process_group
+        self.dp_process_group=self.slice_pg
+
         self.sequence_parallel_size = groups._get_sequence_parallel_world_size()
         #expert parallel group
         self.ep_process_group = expert_parallel_group
@@ -221,7 +301,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         #For MoE models this maybe different for different param group
         #It will be modified during MoE setup later in the init
-        self.real_dp_process_group = [dp_process_group for i in range(len(self.optimizer.param_groups))]
+        self.real_dp_process_group = [self.dp_process_group for i in range(len(self.optimizer.param_groups))]
         self.partition_count = [dp_size for i in range(len(self.optimizer.param_groups))]
 
         self.is_gradient_accumulation_boundary = True
@@ -609,6 +689,50 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.cpu_offload:
             self._create_optimizer_mapping()
 
+    def shuffle_exchange(self):
+        if self.method!="shuffle":return 
+        # logger.info(f"[Rank {self.real_rank}] batch_count: {self.batch_count}")
+        self.batch_count+=1
+        if self.batch_count%self.shuffle_step==0:
+            self._shuffle()
+    def _shuffle(self):
+        if self.world_size%self.rings:
+            logger.error("rings cannot be divided by world size")
+        # logger.info(f"[Rank {self.real_rank}] world_group_size: {dist.get_world_size(self.world_group)}")
+        for pg in self.allreduce_groups:dist.destroy_process_group(pg)
+        self.allreduce_groups=[]
+        self.allreduce_group=None
+        arrange = torch.randperm(self.world_size).view(self.rings, -1)
+        arrange = arrange.tolist()
+        for group in arrange:
+            allreduce_group=self._create_real_groups(group,self.allreduce_groups)
+            if allreduce_group!=None:
+                self.allreduce_group=allreduce_group
+        # logger.info(f"[Rank {self.real_rank}] Creating allreduce_group: {self.allreduce_group}")
+    
+    def _create_real_groups(self,group,allreduce_groups):
+        allreduce_group=None
+        for offset in range(self.slice_count):
+            real_group = [element * self.slice_count + offset for element in group]
+            allreduce_groups.append(dist.new_group(real_group))
+            # logger.info(f"[Rank {self.real_rank}] Creating real_group: {real_group}")
+            if self.real_rank in real_group:
+                allreduce_group=allreduce_groups[-1]
+        return allreduce_group
+    def synchronization(self):
+        if self.method!="shuffle" and self.method!="Gossip":return 
+        for tensor in self.bit16_groups_flat:
+            tensor.div_(self.real_world_size)
+            dist.all_reduce(tensor,group=self.world_group)
+        for i in range(len(self.bit16_groups)):
+            self._update_model_bit16_weights(i)
+    
+    def reset_rings(self,rings):
+        if self.method!="shuffle":return 
+        self.rings=rings
+        self._shuffle()
+        self.batch_count=0
+    
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
             for p in self.bit16_groups[i]:
@@ -1942,7 +2066,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # First compute norm for all group so we know if there is overflow
         if self.check_grad_overflow:
             self.check_overflow(partition_gradients=self.partition_gradients)
-
+        if self.dtype == torch.float16:
+            self.check_overflow()
+        overflow = torch.tensor(int(self.overflow), dtype=torch.int32, device="cuda")
+        dist.all_reduce(overflow, op=dist.ReduceOp.SUM)
+        self.overflow=overflow.item()>0
         prev_scale = self.loss_scale
         self._update_scale(self.overflow)
         if self.overflow:
@@ -1960,7 +2088,25 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 self.timers(timer).start()
                 self.timers(timer).stop()
             return
-
+        
+        if self.method=="Gossip":
+            for i in range(len(self.parallel_partitioned_bit16_groups)):
+                self.parallel_partitioned_bit16_groups[i][self.slice_partition]=self.parallel_partitioned_bit16_groups[i][self.slice_partition].to(self.device)
+                # if self.real_rank==0:logger.info(f"{tensor.device}")
+            self.alpha=self.alpha.to(self.device)        
+            for temp in self.msg[self.rank]:
+                for i in range(len(self.parallel_partitioned_bit16_groups)):
+                    tensor=self.parallel_partitioned_bit16_groups[i][self.slice_partition]
+                    tensor.mul_(self.alpha)
+                    temp["param"][i].mul_(temp["alpha"])
+                    tensor.add_(temp["param"][i])
+                    tensor.div_(self.alpha+temp["alpha"])
+                self.alpha.add_(temp["alpha"])
+            self.msg[self.rank].clear()
+            for i in range(len(self.parallel_partitioned_bit16_groups)):
+                self.parallel_partitioned_bit16_groups[i][self.slice_partition]=self.parallel_partitioned_bit16_groups[i][self.slice_partition].to("cuda")
+            self.alpha=self.alpha.to("cuda")
+        
         # Step 1:- Calculate gradient norm using bit-16 grads
         see_memory_usage('Before norm calculation')
         scaled_global_grad_norm = self.scaled_global_norm()
@@ -2033,8 +2179,76 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         see_memory_usage('After optimizer before all-gather')
         if self.cpu_offload:
             self.reset_cpu_buffers()
-
+        
         self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
+        
+        def send_tensor_in_chunks(tensor, dest, chunk_size=4000000000):
+            for i in range(0, tensor.numel(), chunk_size):
+                chunk = tensor.view(-1)[i:i+chunk_size].cuda()
+                dist.send(chunk, dest)
+
+        def recv_tensor_in_chunks(tensor, src, chunk_size=4000000000):
+            for i in range(0, tensor.numel(), chunk_size):
+                chunk = torch.empty(chunk_size, dtype=torch.float16, device="cuda")
+                dist.recv(chunk, src)
+                tensor.view(-1)[i:i+chunk_size] = chunk.cpu()
+
+        
+        if self.method=="Gossip":
+            for i in range(len(self.parallel_partitioned_bit16_groups)):
+                self.parallel_partitioned_bit16_groups[i][self.slice_partition]=self.parallel_partitioned_bit16_groups[i][self.slice_partition].to(self.device)   
+            S = torch.bernoulli(torch.full((self.world_size,), self.p, dtype=torch.float))
+            selected_ranks = [i for i in range(self.world_size) if S[i].item()== 1]
+            for id in selected_ranks:
+                if S[id]==0:continue
+                dest=torch.randint(0, self.world_size, (1,)).item()
+                if id==dest:continue
+                if self.rank==id:
+                    self.alpha.div_(2)
+                    real_dest=dest*self.slice_count+self.slice_partition
+                    # logger.info(f"[Rank:{self.real_rank}] self.alpha in device:{self.alpha.device}")
+                    dist.send(self.alpha,real_dest)
+                    for i in range(len(self.parallel_partitioned_bit16_groups)):
+                        send_tensor_in_chunks(self.parallel_partitioned_bit16_groups[i][self.slice_partition],real_dest)
+                if self.rank==dest:
+                    temp={"param":[],"alpha":torch.empty_like(self.alpha,device="cuda")}
+                    real_src=id*self.slice_count+self.slice_partition
+                    # logger.info(f"[Rank:{self.real_rank}] temp in device:{temp['alpha'].device}")
+                    # logger.info(f"[Rank:{self.real_rank}] self.device in device:{self.device}")
+                    dist.recv(temp["alpha"],real_src)
+                    for i in range(len(self.parallel_partitioned_bit16_groups)):
+                        tensor=torch.empty_like(self.parallel_partitioned_bit16_groups[i][self.slice_partition],device=self.device)
+                        recv_tensor_in_chunks(tensor,real_src)
+                        temp["param"].append(tensor)
+                    temp["alpha"]=temp["alpha"].to(self.device)
+                    self.msg[dest].append(temp)
+            for i in range(len(self.parallel_partitioned_bit16_groups)):
+                self.parallel_partitioned_bit16_groups[i][self.slice_partition]=self.parallel_partitioned_bit16_groups[i][self.slice_partition].to("cuda")
+        else :
+            # dist.barrier()
+            for i in range(len(self.parallel_partitioned_bit16_groups)):
+                tensor=self.parallel_partitioned_bit16_groups[i][self.slice_partition]
+                if self.method=="RR":
+                    tensor.div_(self.world_size)
+                    dist.all_reduce(tensor,group=self.allreduce_group)
+                if self.method=="shuffle":
+                    tensor.div_(self.world_size//self.rings)
+                    dist.all_reduce(tensor,group=self.allreduce_group)
+                if self.method=="H-RR":
+                    tensor.div_(self.world_size)
+                    # logger.info(f"[Rank {self.real_rank}] allreduce_group:{dist.get_all_ranks_from_group(self.allreduce_group)}")
+                    # logger.info(f"[Rank {self.real_rank}] top_node:{self.top_node}")
+                    if self.top_node not in dist.get_all_ranks_from_group(self.allreduce_group):
+                        logger.error("ERRRR!!!!!")
+                    dist.reduce(tensor=tensor,dst=self.top_node,group=self.allreduce_group)
+                    # dist.barrier(group=self.allreduce_group)
+                    if self.in_top_group: 
+                        # logger.info(f"[Rank {self.real_rank}] top_allredece_group:{dist.get_all_ranks_from_group(self.top_allreduce_group)}")
+                        dist.all_reduce(tensor=tensor,group=self.top_allreduce_group)
+                        # dist.barrier(group=self.top_allreduce_group)
+                    dist.broadcast(tensor=tensor,src=self.top_node,group=self.allreduce_group)
+            # dist.barrier(self.allreduce_group)
+        
         # Gather the updated weights from everyone.
         # Then all partitions of the model parameters are updated and ready for next round forward.
         all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
@@ -2640,3 +2854,4 @@ def estimate_zero2_model_states_mem_needs_all_cold(total_params,
 
         options_str = format_options(cpu_offload=cpu_offload)
         print(f" {cpu_mem/2**30:7.2f}GB | {gpu_mem/2**30:6.2f}GB | {options_str}")
+    

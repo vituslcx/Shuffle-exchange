@@ -208,7 +208,11 @@ class DeepSpeedEngine(Module):
                  config=None,
                  config_class=None,
                  mesh_device=None,
-                 dont_change_device=False):
+                 dont_change_device=False,
+                 rings=8,
+                 shuffle_step=50,
+                 method="RR",
+                 slice_count=2):
         super(DeepSpeedEngine, self).__init__()
         self.dont_change_device = dont_change_device
         self.client_optimizer = optimizer
@@ -251,6 +255,12 @@ class DeepSpeedEngine(Module):
         self.scale_wrt_gas = None
         self.losses = None
         self.mesh_device = mesh_device
+        self.pg=None
+        self.rings=rings
+        self.counter=0
+        self.shuffle_step=shuffle_step
+        self.method=method
+        self.slice_count=slice_count
 
         # for debug purposes - can then debug print: debug_get_module_name(module)
         debug_extract_module_and_param_names(model)
@@ -1687,7 +1697,8 @@ class DeepSpeedEngine(Module):
         else:
             check_grad_overflow = False
 
-        timers = self.timers if self.wall_clock_breakdown() else NoopTimer()
+        # timers = self.timers if self.wall_clock_breakdown() else NoopTimer()
+        timers = self.timers
 
         if optimizer is None:
             optimizer = DummyOptim(list(self.module.parameters()))
@@ -1739,8 +1750,12 @@ class DeepSpeedEngine(Module):
                 gradient_accumulation_dtype=gradient_accumulation_dtype,
                 communication_data_type=self.communication_data_type,
                 elastic_checkpoint=self.zero_elastic_checkpoint(),
-                check_grad_overflow=check_grad_overflow)
-
+                check_grad_overflow=check_grad_overflow,
+                shuffle_step=self.shuffle_step,
+                rings=self.rings,
+                method=self.method,
+                slice_count=self.slice_count)
+            
         elif zero_stage == ZeroStageEnum.weights:
             assert not self.has_moe_layers, "MoE not supported with Stage 3"
             if isinstance(optimizer, DummyOptim):
